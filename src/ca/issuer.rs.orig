@@ -1,0 +1,201 @@
+//! Certificate Issuance Logic
+
+use crate::qx509::*;
+use super::intermediate_ca::IntermediateCA;
+use chrono::{Utc, Duration};
+
+/// Certificate request (CSR equivalent)
+pub struct CertificateRequest {
+    pub subject: DistinguishedName,
+    pub public_key: Vec<u8>,
+    pub public_key_algorithm: certificate_full::PublicKeyAlgorithm,
+    pub extensions: Vec<extensions_full::Extension>,
+}
+
+impl CertificateRequest {
+    pub fn new(
+        subject: DistinguishedName,
+        public_key: Vec<u8>,
+        algorithm: certificate_full::PublicKeyAlgorithm,
+    ) -> Self {
+        Self {
+            subject,
+            public_key,
+            public_key_algorithm: algorithm,
+            extensions: Vec::new(),
+        }
+    }
+    
+    pub fn add_extension(mut self, ext: extensions_full::Extension) -> Self {
+        self.extensions.push(ext);
+        self
+    }
+}
+
+/// Certificate issuer
+pub struct CertificateIssuer<'a> {
+    ca: &'a mut IntermediateCA,
+}
+
+impl<'a> CertificateIssuer<'a> {
+    pub fn new(ca: &'a mut IntermediateCA) -> Self {
+        Self { ca }
+    }
+    
+    /// Issue an end-entity certificate
+    pub fn issue_certificate(
+        &mut self,
+        request: CertificateRequest,
+        validity_days: i64,
+    ) -> Result<certificate_full::CertificateFull> {
+        let serial = self.ca.next_serial();
+        
+        let now = Utc::now();
+        let not_after = now + Duration::days(validity_days);
+        
+        let mut builder = certificate_full::CertificateFull::builder()
+            .serial_number(serial)
+            .issuer(self.ca.certificate().subject.clone())
+            .subject(request.subject)
+            .validity(now, not_after)
+            .public_key(request.public_key_algorithm, request.public_key.clone());
+        
+        // Add default extensions
+        builder = builder
+            .add_extension(extensions_full::Extension::BasicConstraints(
+                extensions_full::BasicConstraintsExt::end_entity()
+            ))
+            .add_extension(extensions_full::Extension::SubjectKeyIdentifier(
+                extensions_full::SubjectKeyIdentifierExt::from_public_key(&request.public_key)
+            ))
+            .add_extension(extensions_full::Extension::AuthorityKeyIdentifier(
+                extensions_full::AuthorityKeyIdentifierExt::from_public_key(
+                    &self.ca.certificate().subject_public_key_info.public_key
+                )
+            ));
+        
+        // Add requested extensions
+        for ext in request.extensions {
+            builder = builder.add_extension(ext);
+        }
+        
+        let mut cert = builder.build()?;
+        
+        // Sign the certificate
+        self.ca.sign_certificate(&mut cert)?;
+        
+        Ok(cert)
+    }
+    
+    /// Issue server certificate
+    pub fn issue_server_certificate(
+        &mut self,
+        common_name: String,
+        alt_names: Vec<String>,
+        public_key: Vec<u8>,
+        validity_days: i64,
+    ) -> Result<certificate_full::CertificateFull> {
+        let subject = DistinguishedName::new(common_name);
+        
+        let mut san = extensions_full::SubjectAlternativeNameExt::dns_names(alt_names);
+        san.critical = false;
+        
+        let mut ku = extensions_full::KeyUsageExt::new(
+            extensions_full::KeyUsageFlags::DigitalSignature as u32 |
+            extensions_full::KeyUsageFlags::KeyAgreement as u32
+        );
+        ku.critical = true;
+        
+        let eku = extensions_full::ExtendedKeyUsageExt {
+            critical: false,
+            usages: vec![
+                extensions_full::ExtendedKeyUsageType::ServerAuth,
+            ],
+        };
+        
+        let request = CertificateRequest::new(
+            subject,
+            public_key,
+            certificate_full::PublicKeyAlgorithm::VLK1,
+        )
+        .add_extension(extensions_full::Extension::SubjectAlternativeName(san))
+        .add_extension(extensions_full::Extension::KeyUsage(ku))
+        .add_extension(extensions_full::Extension::ExtendedKeyUsage(eku));
+        
+        self.issue_certificate(request, validity_days)
+    }
+    
+    /// Issue client certificate
+    pub fn issue_client_certificate(
+        &mut self,
+        common_name: String,
+        email: Option<String>,
+        public_key: Vec<u8>,
+        validity_days: i64,
+    ) -> Result<certificate_full::CertificateFull> {
+        let subject = DistinguishedName::new(common_name);
+        
+        let mut ku = extensions_full::KeyUsageExt::new(
+            extensions_full::KeyUsageFlags::DigitalSignature as u32
+        );
+        ku.critical = true;
+        
+        let eku = extensions_full::ExtendedKeyUsageExt {
+            critical: false,
+            usages: vec![
+                extensions_full::ExtendedKeyUsageType::ClientAuth,
+                extensions_full::ExtendedKeyUsageType::EmailProtection,
+            ],
+        };
+        
+        let mut request = CertificateRequest::new(
+            subject,
+            public_key,
+            certificate_full::PublicKeyAlgorithm::VoxSig,
+        )
+        .add_extension(extensions_full::Extension::KeyUsage(ku))
+        .add_extension(extensions_full::Extension::ExtendedKeyUsage(eku));
+        
+        if let Some(email) = email {
+            let mut san = extensions_full::SubjectAlternativeNameExt {
+                critical: false,
+                names: vec![extensions_full::GeneralName::RFC822Name(email)],
+            };
+            request = request.add_extension(extensions_full::Extension::SubjectAlternativeName(san));
+        }
+        
+        self.issue_certificate(request, validity_days)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::root_ca::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_issue_server_certificate() {
+        let root_dir = TempDir::new().unwrap();
+        let int_dir = TempDir::new().unwrap();
+        
+        let mut root_ca = RootCA::initialize(root_dir.path(), RootCAConfig::default()).unwrap();
+        let mut int_ca = IntermediateCA::initialize(
+            int_dir.path(),
+            IntermediateCAConfig::default(),
+            &mut root_ca,
+        ).unwrap();
+        
+        let mut issuer = CertificateIssuer::new(&mut int_ca);
+        
+        let cert = issuer.issue_server_certificate(
+            "example.com".to_string(),
+            vec!["www.example.com".to_string()],
+            vec![1, 2, 3],
+            365,
+        ).unwrap();
+        
+        assert!(!cert.is_ca());
+        assert!(cert.key_usage().is_some());
+    }
+}

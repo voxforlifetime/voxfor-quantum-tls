@@ -1,0 +1,11 @@
+--- src/ca/issuer.rs.orig
++++ src/ca/issuer.rs
+@@ -175,7 +175,7 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::ca::root_ca::*;
++    use crate::ca::root_ca::{RootCA, RootCAConfig};
+     use tempfile::TempDir;
+ 
+     #[test]
