@@ -1,7 +1,7 @@
 [package]
 name = "voxfor-quantum-tls"
 version = "1.0.0"
-edition = "2021"
+edition = "2025"
 authors = ["Netanel Siboni <netanel@voxfor.com>"]
 description = "Production-grade quantum-resistant TLS/SSL implementation"
 license = "MIT"
